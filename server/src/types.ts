@@ -1,0 +1,4 @@
+export type Suspect = { id: string; name: string; role: string; background: string; relationship: string; motive: string; initialStatement: string; alibi: string; knowledge: string };
+export type Clue = { id: string; title: string; description: string; location: string; relevance: string; isDiscoverable: boolean };
+export type Mystery = { title: string; introduction: string; description: string; suspects: Suspect[]; clues: Clue[]; timeline: string[]; culpritId: string; solution: string; motive: string; decisiveClueIds: string[]; hints: [string, string, string] };
+export type Game = { id: string; mystery: Mystery; discoveredClueIds: string[]; interrogationHistory: { suspectId: string; question: string; answer: string }[]; hintsUsed: number; status: 'active' | 'complete'; accusedSuspectId?: string; correct?: boolean; score?: number; createdAt: string };
