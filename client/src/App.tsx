@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { ArrowLeft, ArrowRight, BadgeAlert, BookOpen, Check, ChevronDown, Clock3, Fingerprint, FolderOpen, Lightbulb, LoaderCircle, LockKeyhole, MessageCircle, Plus, Search, Send, Shield, UserRound, X } from 'lucide-react';
-import { api, type Clue, type Game, type Result, type SavedCase, type Suspect } from './api';
+import { api, type Clue, type Game, type Result, type SavedCase, type Suspect, type User } from './api';
 import './cases.css';
 
 type ChatLine = { speaker: 'you' | 'suspect'; text: string };
@@ -22,6 +22,27 @@ function formatDate(value: string): string {
 }
 
 export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
+  const authPage = window.location.pathname === '/login' || window.location.pathname === '/signup' ? window.location.pathname.slice(1) : 'welcome';
+  useEffect(() => {
+    let active = true;
+    api.me().then(({ user: current }) => { if (active) setUser(current); }).catch(() => { if (active) setUser(null); }).finally(() => { if (active) setAuthLoading(false); });
+    return () => { active = false; };
+  }, []);
+  useEffect(() => { const expired = () => setUser(null); window.addEventListener('auth-expired', expired); return () => window.removeEventListener('auth-expired', expired); }, []);
+  const submitAuth = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); setAuthError(''); setAuthBusy(true);
+    const form = new FormData(event.currentTarget);
+    const name = String(form.get('name') || ''); const email = String(form.get('email') || ''); const password = String(form.get('password') || '');
+    if (authPage === 'signup' && password !== String(form.get('confirmPassword') || '')) { setAuthError('Passwords do not match.'); setAuthBusy(false); return; }
+    try {
+      if (authPage === 'signup') await api.signup(name, email, password); else await api.login(email, password);
+      window.location.assign('/');
+    } catch (error) { setAuthError(error instanceof Error ? error.message : 'Authentication failed.'); setAuthBusy(false); }
+  };
   const [game, setGame] = useState<Game | null>(null);
   const [result, setResult] = useState<Result | null>(null);
   const [busy, setBusy] = useState(false);
@@ -51,9 +72,21 @@ export default function App() {
     }
   };
 
-  useEffect(() => {
-    void loadCases();
-  }, []);
+  useEffect(() => { if (user) void loadCases(); else { setSavedCases([]); setCasesLoading(false); } }, [user]);
+
+  if (authLoading) return <main className="app-shell auth-shell"><div className="cases-message"><LoaderCircle className="spin" size={17} /> Restoring your session…</div></main>;
+  if (!user) return <main className="app-shell auth-shell">
+    <header className="topbar"><a className="brand" href="/"><span className="brand-mark"><Fingerprint size={19} /></span><span>AI MYSTERY ROOM</span></a><div className="top-actions"><a className="auth-nav" href="/login">Log in</a><a className="auth-nav signup-link" href="/signup">Sign up</a></div></header>
+    {authPage === 'welcome' ? <section className="auth-welcome"><div className="eyebrow"><span /> YOUR NEXT CASE AWAITS</div><h1>Some truths<br />prefer <em>the dark.</em></h1><p className="hero-copy">A locked room. A handful of suspects. One story that doesn’t add up. Step inside and find out what really happened.</p><div className="auth-choices"><a className="primary-btn" href="/signup">Create your account <ArrowRight size={16} /></a><a className="secondary-btn" href="/login">I already have an account</a></div><div className="hero-bottom auth-promise"><span><LockKeyhole size={14} /> PRIVATE CASE FILES. REAL DEDUCTION.</span><span>EST. 2024</span></div></section> : <section className="auth-card"><div className="eyebrow centered"><span /> DETECTIVE DIVISION</div><h1>{authPage === 'signup' ? 'Open a case file.' : 'Welcome back.'}</h1><p>{authPage === 'signup' ? 'Create your account to keep every investigation in your archive.' : 'Log in to return to your investigations.'}</p><form onSubmit={submitAuth}>
+      {authPage === 'signup' && <label>Full name<input name="name" autoComplete="name" required maxLength={100} /></label>}
+      <label>Email address<input name="email" type="email" autoComplete="email" required maxLength={254} /></label>
+      <label>Password<input name="password" type="password" autoComplete={authPage === 'signup' ? 'new-password' : 'current-password'} required minLength={authPage === 'signup' ? 8 : 1} maxLength={128} /></label>
+      {authPage === 'signup' && <label>Confirm password<input name="confirmPassword" type="password" autoComplete="new-password" required minLength={8} maxLength={128} /></label>}
+      {authError && <div className="auth-error" role="alert">{authError}</div>}
+      <button className="primary-btn auth-submit" disabled={authBusy}>{authBusy ? 'Please wait…' : authPage === 'signup' ? 'Create account' : 'Log in'} <ArrowRight size={16} /></button>
+    </form><div className="auth-switch">{authPage === 'signup' ? <>Already have an account? <a href="/login">Log in</a></> : <>New to the division? <a href="/signup">Create an account</a></>}</div></section>}
+    <footer className="footer"><span>AI MYSTERY ROOM <i>·</i> A GAME OF OBSERVATION</span><span><Clock3 size={13} /> EVERY DETAIL MATTERS</span></footer>
+  </main>;
 
   const start = async () => {
     setBusy(true);
@@ -175,6 +208,8 @@ export default function App() {
       <div className="top-meta"><span className="status-dot" /> CASE FILES <span className="top-divider" /> <span>NO. {game ? '00482' : '00000'}</span></div>
       <div className="top-actions">
         <button className="nav-case-button" onClick={showCases}><FolderOpen size={14} /> My Cases</button>
+        <span className="profile-name">{user.name}</span>
+        <button className="auth-nav" onClick={() => { void api.logout().finally(() => window.location.assign('/')); }}>Log out</button>
         <button className="icon-btn help-btn" aria-label="Help" onClick={() => setError('Investigate each clue, question suspects, then choose who you believe is responsible.')}>?</button>
       </div>
     </header>

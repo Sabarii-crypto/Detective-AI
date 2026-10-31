@@ -1,4 +1,12 @@
-import { model, Schema } from 'mongoose';
+import { model, Schema, Types } from 'mongoose';
+
+export interface UserRecord { name: string; email: string; passwordHash: string; createdAt: Date }
+const userSchema = new Schema<UserRecord>({
+  name: { type: String, required: true, trim: true, minlength: 1, maxlength: 100 },
+  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  passwordHash: { type: String, required: true, select: false },
+  createdAt: { type: Date, default: Date.now, required: true },
+});
 
 export interface MysteryRecord {
   id: string;
@@ -47,6 +55,7 @@ export interface InterrogationRecord {
 export interface GameSessionRecord {
   id: string;
   mysteryId: string;
+  ownerId?: Types.ObjectId;
   discoveredClueIds: string[];
   interrogationHistory: InterrogationRecord[];
   hintsUsed: number;
@@ -106,6 +115,7 @@ const interrogationSchema = new Schema<InterrogationRecord>({
 const gameSessionSchema = new Schema<GameSessionRecord>({
   id: { type: String, required: true, unique: true, index: true },
   mysteryId: { type: String, required: true, index: true },
+  ownerId: { type: Schema.Types.ObjectId, ref: 'User', index: true },
   discoveredClueIds: { type: [String], default: [] },
   interrogationHistory: { type: [interrogationSchema], default: [] },
   hintsUsed: { type: Number, default: 0 },
@@ -115,6 +125,8 @@ const gameSessionSchema = new Schema<GameSessionRecord>({
   score: Number,
   createdAt: { type: Date, required: true, default: Date.now },
 });
+
+export const UserModel = model<UserRecord>('User', userSchema);
 
 export const MysteryModel = model<MysteryRecord>('Mystery', mysterySchema);
 export const SuspectModel = model<SuspectRecord>('Suspect', suspectSchema);

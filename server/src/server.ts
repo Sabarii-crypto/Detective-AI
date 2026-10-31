@@ -4,18 +4,46 @@ import express from 'express';
 import mongoose, { type HydratedDocument } from 'mongoose';
 import { randomUUID } from 'node:crypto';
 import rateLimit from 'express-rate-limit';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { generateMystery } from './mystery.js';
-import { ClueModel, GameSessionModel, MysteryModel, SuspectModel } from './models.js';
+import { ClueModel, GameSessionModel, MysteryModel, SuspectModel, UserModel } from './models.js';
 import type { ClueRecord, GameSessionRecord, MysteryRecord, SuspectRecord } from './models.js';
 import type { Game, Mystery } from './types.js';
 
 const app = express();
-app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173' }));
+const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173').split(',').map((origin) => origin.trim()).filter(Boolean);
+app.use(cors({ origin: (origin, callback) => callback(null, origin && allowedOrigins.includes(origin) ? origin : false), credentials: true }));
 app.use(express.json({ limit: '20kb' }));
 app.use('/api', rateLimit({ windowMs: 60_000, limit: 40, standardHeaders: true, legacyHeaders: false }));
 
 type LoadedGame = { game: Game; session: HydratedDocument<GameSessionRecord> };
+
+declare global { namespace Express { interface Request { userId?: string } } }
+
+const cookieName = 'mystery_session';
+const productionCookie = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
+const cookieOptions = () => ({ httpOnly: true, secure: productionCookie, sameSite: (productionCookie ? 'none' : 'lax') as 'none' | 'lax', path: '/', maxAge: 7 * 24 * 60 * 60 * 1000 });
+function clearSessionCookie(res: express.Response): void {
+  const { maxAge: _maxAge, ...options } = cookieOptions();
+  res.clearCookie(cookieName, options);
+}
+function tokenFrom(req: express.Request): string | undefined {
+  const cookieHeader = req.headers.cookie || '';
+  const value = cookieHeader.split(';').map((part) => part.trim()).find((part) => part.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1);
+  return value;
+}
+const authenticate = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const token = tokenFrom(req);
+  if (!token) { res.status(401).json({ error: 'Please log in to continue.' }); return; }
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as jwt.JwtPayload;
+    if (typeof payload.sub !== 'string' || !mongoose.isValidObjectId(payload.sub) || typeof payload.exp !== 'number' || payload.exp <= Date.now() / 1000) throw new Error('Invalid subject or expiry');
+    req.userId = payload.sub;
+    next();
+  } catch { clearSessionCookie(res); res.status(401).json({ error: 'Your session has expired. Please log in again.' }); }
+};
 
 const route = (fn: (req: express.Request, res: express.Response) => Promise<void> | void) =>
   (req: express.Request, res: express.Response, next: express.NextFunction) =>
@@ -93,8 +121,8 @@ function publicGame(game: Game) {
   };
 }
 
-async function loadGame(id: string): Promise<LoadedGame | null> {
-  const session = await GameSessionModel.findOne({ id });
+async function loadGame(id: string, ownerId: string): Promise<LoadedGame | null> {
+  const session = await GameSessionModel.findOne({ id, ownerId });
   if (!session) return null;
 
   const [mystery, suspects, clues] = await Promise.all([
@@ -145,7 +173,39 @@ app.get('/api/health', (_req, res) => {
   res.status(connected ? 200 : 503).json({ ok: connected });
 });
 
-app.post('/api/mysteries/generate', route(async (_req, res) => {
+const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: true, legacyHeaders: false });
+app.post('/api/auth/signup', authLimiter, route(async (req, res) => {
+  const parsed = z.object({ name: z.string().trim().min(1).max(100), email: z.string().trim().email().max(254), password: z.string().min(8).max(128) }).safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'Enter a name, valid email, and password of at least 8 characters.' }); return; }
+  const email = parsed.data.email.toLowerCase();
+  if (await UserModel.exists({ email })) { res.status(409).json({ error: 'An account with that email already exists.' }); return; }
+  try {
+    const user = await UserModel.create({ name: parsed.data.name, email, passwordHash: await bcrypt.hash(parsed.data.password, 12) });
+    const token = jwt.sign({}, process.env.JWT_SECRET!, { subject: user._id.toString(), expiresIn: '7d' });
+    res.cookie(cookieName, token, cookieOptions()).status(201).json({ user: { id: user._id.toString(), name: user.name, email: user.email } });
+  } catch (error) {
+    if ((error as { code?: number }).code === 11000) { res.status(409).json({ error: 'An account with that email already exists.' }); return; }
+    throw error;
+  }
+}));
+app.post('/api/auth/login', authLimiter, route(async (req, res) => {
+  const parsed = z.object({ email: z.string().trim().email().max(254), password: z.string().min(1).max(128) }).safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: 'Enter a valid email and password.' }); return; }
+  const user = await UserModel.findOne({ email: parsed.data.email.toLowerCase() }).select('+passwordHash');
+  if (!user || !(await bcrypt.compare(parsed.data.password, user.passwordHash))) { res.status(401).json({ error: 'Email or password is incorrect.' }); return; }
+  const token = jwt.sign({}, process.env.JWT_SECRET!, { subject: user._id.toString(), expiresIn: '7d' });
+  res.cookie(cookieName, token, cookieOptions()).json({ user: { id: user._id.toString(), name: user.name, email: user.email } });
+}));
+app.post('/api/auth/logout', (_req, res) => { clearSessionCookie(res); res.status(204).end(); });
+app.get('/api/auth/me', authenticate, route(async (req, res) => {
+  const user = await UserModel.findById(req.userId).select('name email');
+  if (!user) { clearSessionCookie(res); res.status(401).json({ error: 'Please log in to continue.' }); return; }
+  res.json({ user: { id: user._id.toString(), name: user.name, email: user.email } });
+}));
+
+app.use('/api', (req, res, next) => req.path === '/health' ? next() : authenticate(req, res, next));
+
+app.post('/api/mysteries/generate', route(async (req, res) => {
   let mystery: Mystery;
   try {
     mystery = await generateMystery();
@@ -157,7 +217,7 @@ app.post('/api/mysteries/generate', route(async (_req, res) => {
   const mysteryId = randomUUID();
   const gameId = randomUUID();
   await saveMystery(mysteryId, mystery);
-  const session = await GameSessionModel.create({ id: gameId, mysteryId });
+  const session = await GameSessionModel.create({ id: gameId, mysteryId, ownerId: req.userId });
   res.status(201).json(publicGame(gameFromRecords(
     session,
     { id: mysteryId, ...mystery },
@@ -166,8 +226,8 @@ app.post('/api/mysteries/generate', route(async (_req, res) => {
   )));
 }));
 
-app.get('/api/games', route(async (_req, res) => {
-  const sessions = await GameSessionModel.find().sort({ createdAt: -1 }).lean();
+app.get('/api/games', route(async (req, res) => {
+  const sessions = await GameSessionModel.find({ ownerId: req.userId }).sort({ createdAt: -1 }).lean();
   if (!sessions.length) {
     res.json([]);
     return;
@@ -188,7 +248,7 @@ app.get('/api/games', route(async (_req, res) => {
 }));
 
 app.get('/api/games/:gameId', route(async (req, res) => {
-  const loaded = await loadGame(req.params.gameId);
+  const loaded = await loadGame(req.params.gameId, req.userId!);
   if (!loaded) {
     res.status(404).json({ error: 'Game not found. Start a new mystery to play.' });
     return;
@@ -197,7 +257,7 @@ app.get('/api/games/:gameId', route(async (req, res) => {
 }));
 
 app.get('/api/games/:gameId/suspects', route(async (req, res) => {
-  const loaded = await loadGame(req.params.gameId);
+  const loaded = await loadGame(req.params.gameId, req.userId!);
   if (!loaded) {
     res.status(404).json({ error: 'Game not found. Start a new mystery to play.' });
     return;
@@ -206,7 +266,7 @@ app.get('/api/games/:gameId/suspects', route(async (req, res) => {
 }));
 
 app.post('/api/games/:gameId/clues/:clueId/discover', route(async (req, res) => {
-  const loaded = await loadGame(req.params.gameId);
+  const loaded = await loadGame(req.params.gameId, req.userId!);
   if (!loaded) {
     res.status(404).json({ error: 'Game not found. Start a new mystery to play.' });
     return;
@@ -232,7 +292,7 @@ app.post('/api/games/:gameId/clues/:clueId/discover', route(async (req, res) => 
 }));
 
 app.post('/api/games/:gameId/interrogate', route(async (req, res) => {
-  const loaded = await loadGame(req.params.gameId);
+  const loaded = await loadGame(req.params.gameId, req.userId!);
   if (!loaded) {
     res.status(404).json({ error: 'Game not found. Start a new mystery to play.' });
     return;
@@ -280,7 +340,7 @@ app.post('/api/games/:gameId/interrogate', route(async (req, res) => {
 }));
 
 app.post('/api/games/:gameId/hint', route(async (req, res) => {
-  const loaded = await loadGame(req.params.gameId);
+  const loaded = await loadGame(req.params.gameId, req.userId!);
   if (!loaded) {
     res.status(404).json({ error: 'Game not found. Start a new mystery to play.' });
     return;
@@ -301,7 +361,7 @@ app.post('/api/games/:gameId/hint', route(async (req, res) => {
 }));
 
 app.post('/api/games/:gameId/accuse', route(async (req, res) => {
-  const loaded = await loadGame(req.params.gameId);
+  const loaded = await loadGame(req.params.gameId, req.userId!);
   if (!loaded) {
     res.status(404).json({ error: 'Game not found. Start a new mystery to play.' });
     return;
@@ -329,7 +389,7 @@ app.post('/api/games/:gameId/accuse', route(async (req, res) => {
 }));
 
 app.get('/api/games/:gameId/result', route(async (req, res) => {
-  const loaded = await loadGame(req.params.gameId);
+  const loaded = await loadGame(req.params.gameId, req.userId!);
   if (!loaded) {
     res.status(404).json({ error: 'Game not found. Start a new mystery to play.' });
     return;
@@ -342,15 +402,21 @@ app.get('/api/games/:gameId/result', route(async (req, res) => {
 }));
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  console.error('Request failed:', err);
+  console.error('Request failed.');
   res.status(500).json({ error: 'Something went wrong. Please try again.' });
 });
 
 async function startServer(): Promise<void> {
   const uri = process.env.MONGODB_URI;
   if (!uri) throw new Error('MONGODB_URI is required to start the server.');
-  mongoose.connection.on('error', (error: unknown) => console.error('MongoDB connection error:', error));
-  await mongoose.connect(uri, { serverSelectionTimeoutMS: 10_000 });
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) throw new Error('JWT_SECRET must contain at least 32 characters.');
+  mongoose.connection.on('error', () => console.error('MongoDB connection error.'));
+  try {
+    await mongoose.connect(uri, { serverSelectionTimeoutMS: 10_000 });
+    await UserModel.init();
+  } catch {
+    throw new Error('Could not connect to MongoDB or initialize the user email index. Check MONGODB_URI, database credentials, and Atlas network access.');
+  }
 
   const port = Number(process.env.PORT) || 4000;
   const server = app.listen(port, () => console.log(`AI Mystery Room API listening on port ${port}`));
@@ -364,6 +430,10 @@ async function startServer(): Promise<void> {
 }
 
 void startServer().catch((error: unknown) => {
-  console.error('Could not start AI Mystery Room API:', error);
+  console.error(error instanceof Error && (error.message === 'MONGODB_URI is required to start the server.' || error.message === 'JWT_SECRET must contain at least 32 characters.')
+    ? error.message
+    : error instanceof Error && error.message.startsWith('Could not connect to MongoDB')
+      ? error.message
+      : 'Could not start AI Mystery Room API. Check server configuration and database availability.');
   process.exitCode = 1;
 });
