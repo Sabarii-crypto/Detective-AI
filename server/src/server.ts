@@ -86,7 +86,10 @@ function publicGame(game: Game) {
     timeline: game.mystery.timeline,
     discoveredClueIds: game.discoveredClueIds,
     hintsUsed: game.hintsUsed,
+    usedHints: game.mystery.hints.slice(0, game.hintsUsed),
     status: game.status,
+    interrogationHistory: game.interrogationHistory,
+    accusedSuspectId: game.accusedSuspectId,
   };
 }
 
@@ -161,6 +164,27 @@ app.post('/api/mysteries/generate', route(async (_req, res) => {
     mystery.suspects.map((suspect, order) => ({ ...suspect, mysteryId, order })),
     mystery.clues.map((clue, order) => ({ ...clue, mysteryId, order })),
   )));
+}));
+
+app.get('/api/games', route(async (_req, res) => {
+  const sessions = await GameSessionModel.find().sort({ createdAt: -1 }).lean();
+  if (!sessions.length) {
+    res.json([]);
+    return;
+  }
+  const mysteryIds = [...new Set(sessions.map((session) => session.mysteryId))];
+  const mysteries = await MysteryModel.find({ id: { $in: mysteryIds } }).select('id title').lean();
+  const titles = new Map(mysteries.map((mystery) => [mystery.id, mystery.title]));
+  const cases = sessions.flatMap((session) => {
+    const title = titles.get(session.mysteryId);
+    return title ? [{
+      id: session.id,
+      title,
+      createdAt: session.createdAt.toISOString(),
+      status: session.status,
+    }] : [];
+  });
+  res.json(cases);
 }));
 
 app.get('/api/games/:gameId', route(async (req, res) => {

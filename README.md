@@ -57,6 +57,8 @@ Add the Render service's outbound network access to your Atlas network access li
 
 The server stores data in four collections: `mysteries`, `suspects`, `clues`, and `gamesessions`. Existing game URLs continue to identify sessions after a server restart because session state is read from MongoDB. `MONGODB_URI` and `GEMINI_API_KEY` are server-only values and must not be configured in Vercel.
 
+The frontend's **My Cases** archive lists saved game sessions, including their creation date and whether they are active or complete. Use **Continue Case** to reopen a session; refreshing the page returns to the archive rather than starting a new mystery.
+
 ## Project layout
 
 - `client/` React interface and API client
